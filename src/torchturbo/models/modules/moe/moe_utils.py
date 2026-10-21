@@ -8,6 +8,14 @@ def mask_padding_tokens(
     """Clear padding rows from a flattened token-by-expert tensor."""
     if padding_mask is None:
         return values
+    if padding_mask.reshape(-1).shape[0] != values.reshape(-1).shape[0]:
+        # Multimodal models expand media placeholder positions inside the
+        # model forward: hidden_states grows after the engine-side tensors
+        # were built, so a mask sized for the pre-expansion sequence no
+        # longer aligns. Injected image features are always valid tokens
+        # (never padding), so a length-mismatched mask is treated as absent
+        # rather than crashing the router.
+        return values
     valid_mask = (~padding_mask.reshape(-1).bool()).unsqueeze(-1)
     return values * valid_mask
 

@@ -22,6 +22,7 @@
 
 
 # NOTE: Reference implementation for model architecture; see the model card for production deployment.
+import logging
 import math
 from collections.abc import Sequence
 from copy import deepcopy
@@ -136,7 +137,39 @@ def eager_attention(
 VL_VISION_ATTENTION_FUNCTIONS = {
     "flash_attention_2": multihead_attention,
     "eager": eager_attention,
+    # "sdpa" is the transformers default for the vision sub-config when the
+    # user only selects fa2 for the language side; map it to the same
+    # reference implementation (exact attention, no flash_attn dependency).
+    # First exercised when real pixel_values reach MoonViT.
+    "sdpa": eager_attention,
 }
+
+
+def _resolve_vision_attn_func(attn_implementation: str):
+    """Pick the vision attention kernel with availability fallback.
+
+    flash_attention_2 requires the flash_attn package; on stacks where it is
+    not installed (e.g. NPU: the pip wheel is CUDA-only) fall back to the
+    exact eager attention with a one-time warning. Vision sequences are short
+    (a few hundred patches per image), so eager is acceptable there.
+    """
+    global _VISION_FA2_FALLBACK_WARNED
+    if (
+        attn_implementation == "flash_attention_2"
+        and flash_attn_varlen_func is None
+    ):
+        if not _VISION_FA2_FALLBACK_WARNED:
+            _VISION_FA2_FALLBACK_WARNED = True
+            logging.getLogger(__name__).warning(
+                "flash_attn is not installed; vision attention falls back to "
+                "exact (eager) attention. Install an NPU-compatible "
+                "flash_attn build for the fused path."
+            )
+        return eager_attention
+    return VL_VISION_ATTENTION_FUNCTIONS.get(attn_implementation, eager_attention)
+
+
+_VISION_FA2_FALLBACK_WARNED = False
 
 
 def _apply_rope_input_validation(x, freqs_cis):
@@ -160,7 +193,11 @@ def get_rope_shape_decorate(func):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
+# NOTE: intentionally NOT torch.compile'd. With dynamic=True the dynamo guard
+# for F.interpolate(size=(h, w)) performs a None-vs-tuple comparison that
+# raises InternalTorchDynamoError on the NPU toolchain (first exercised when
+# real pixel_values reach MoonViT). This function is a single small
+# interpolate per distinct grid — eager is fine.
 def get_rope_shape(org, interpolation_mode, shape):
     return (F.interpolate(
         org.permute((2, 0, 1)).unsqueeze(0),
@@ -529,7 +566,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
+        attn_func = _resolve_vision_attn_func(self.attn_implementation)
         attn_out = attn_func(xq,
                              xk,
                              xv,
@@ -900,6 +937,16 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         super().__init__(config)
 
         vt_config = VisionTowerConfig(config.vision_config)
+        # Propagate the top-level attn_implementation into the vision tower
+        # config. HF's from_pretrained sets it only on the top-level config
+        # (e.g. LlamaFactory's ``--flash_attn fa2`` -> "flash_attention_2");
+        # the nested vision_config keeps its "sdpa" default, which the vision
+        # attention dispatch used to miss (KeyError). The top-level choice is
+        # the authoritative user intent (same convention the RL loaders
+        # follow when they configure attn_impl), so the vision tower follows
+        # it. MoonViT supports flash_attention_2 (see _supports_flash_attn_2).
+        if getattr(config, "_attn_implementation", None):
+            vt_config._attn_implementation = config._attn_implementation
         self.vision_tower = MoonViT3dPretrainedModel(vt_config)
 
         proj_config = ProjectorConfig(config.vision_config)
@@ -984,6 +1031,13 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         image_token_index: int = self.config.media_placeholder_token_id
         pad_token_id: int = self.config.pad_token_id
         ignore_index: int = self.config.ignore_index
+
+        # Packed/varlen paths (cu_seqlens) pass no dense attention_mask; the
+        # merge math below only needs "every position is valid", which is the
+        # no-padding case. Materialize a default mask instead of assuming
+        # the dense-layout input (crashes with NoneType.dtype otherwise).
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
 
         batch_size, sequence_length = input_ids.shape
         left_padding = not torch.sum(
@@ -1248,13 +1302,24 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             output = (logits, ) + outputs[1:]
             return (loss, ) + output if loss is not None else output
 
-        return LlavaCausalLMOutputWithPast(
+        result = LlavaCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        if labels is not None:
+            # Multimodal expansion: the merge above may have expanded media
+            # placeholders (and labels) to the feature length. Expose the
+            # post-expansion labels so engine-side CE can align them with
+            # logits. Use BOTH dict-style and setattr: ModelOutput's setattr
+            # on a non-dataclass field does not enter the OrderedDict, so
+            # dict-style access (outputs.get) would miss it; keeping both
+            # covers getattr and dict access patterns.
+            result["labels"] = labels
+            result.labels = labels
+        return result
 
     def prepare_inputs_for_generation(
         self,

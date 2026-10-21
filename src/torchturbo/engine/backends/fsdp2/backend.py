@@ -1649,11 +1649,31 @@ class FSDP2Backend(BaseBackend):
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor
+        # Pass labels through to the model forward: multimodal models (e.g.
+        # kimi_k3) expand media placeholders inside forward and return the
+        # post-expansion labels on the output. Without labels in the forward
+        # inputs, the model cannot perform the expansion.
+        inputs["labels"] = labels
         outputs, chunk_hidden_states = self._forward_for_lm_loss(
             model,
             inputs,
             use_chunked_loss=use_chunked_loss,
         )
+        # Multimodal expansion: models that expand media placeholders inside
+        # forward (e.g. kimi_k3) grow logits past the engine-side labels;
+        # such models return the post-expansion labels on the output. Swap
+        # them in only on a length mismatch, so plain text training keeps
+        # the engine-side labels untouched. Try dict access first (the
+        # reliable path for ModelOutput extras), then getattr as fallback.
+        expanded_labels = outputs.get("labels", None) if hasattr(outputs, "get") else None
+        if expanded_labels is None:
+            expanded_labels = getattr(outputs, "labels", None)
+        if (
+            expanded_labels is not None
+            and labels is not None
+            and expanded_labels.shape[-1] != labels.shape[-1]
+        ):
+            labels = expanded_labels
         dspark_loss_fn = getattr(outputs, "dspark_loss_fn", None)
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(

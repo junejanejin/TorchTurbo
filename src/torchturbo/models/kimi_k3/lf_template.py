@@ -39,7 +39,7 @@ def register() -> None:
             stop_words=["<|im_end|>"],
             replace_eos=True,
             mm_plugin=get_mm_plugin(
-                "kimi_k3", image_token="<|kimi_image_placeholder|>"
+                "kimi_k3", image_token="<|media_pad|>"
             ),
         )
         logger.debug("Registered LF template 'kimi_k3'")
