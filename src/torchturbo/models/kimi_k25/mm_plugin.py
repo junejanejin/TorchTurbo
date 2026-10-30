@@ -63,14 +63,19 @@ class KimiK25Plugin(BasePlugin):
                     # (media_input['image'].size). get_mm_inputs already
                     # regularizes via _regularize_images - mirror it here so
                     # tokenize-time N-pad expansion works with path inputs.
+                    if img_idx >= len(images):
+                        raise ValueError(
+                            f"Sample provides {len(images)} image(s) but the "
+                            "conversation has more image placeholders; "
+                            "check the dataset's images column."
+                        )
                     img = images[img_idx]
                     if not isinstance(img, Image.Image):
+                        img_max, img_min = self._image_pixel_bounds(processor)
                         img = self._regularize_images(
                             [img],
-                            image_max_pixels=getattr(
-                                processor, "image_max_pixels", 768 * 768),
-                            image_min_pixels=getattr(
-                                processor, "image_min_pixels", 32 * 32),
+                            image_max_pixels=img_max,
+                            image_min_pixels=img_min,
                         )["images"][0]
                     media_item = {"type": "image", "image": img}
                     seq_len = visual_processor.get_resize_config(media_item)[
@@ -119,6 +124,26 @@ class KimiK25Plugin(BasePlugin):
 
         return messages
 
+    @staticmethod
+    def _image_pixel_bounds(processor) -> tuple[int, int]:
+        """Pixel bounds for LLaMA-Factory's image regularizer.
+
+        The regularizer requires both bounds, but Kimi's processor declares
+        neither ``image_max_pixels`` nor ``image_min_pixels``: the official
+        pipeline bounds the token count itself (navit_resize:
+        in_patch_limit / patch_limit_on_one_side / fixed_output_tokens) on
+        the original image. Falling back to LLaMA-Factory's generic
+        768 * 768 / 32 * 32 default would downscale large images before
+        navit_resize, changing the pad count and the pixels the vision
+        tower sees relative to official preprocessing. The fallbacks here
+        therefore clamp nothing; a processor that does declare bounds still
+        wins.
+        """
+        return (
+            getattr(processor, "image_max_pixels", 10 ** 12),
+            getattr(processor, "image_min_pixels", 1),
+        )
+
     def get_mm_inputs(
         self,
         images: list["ImageInput"],
@@ -135,14 +160,13 @@ class KimiK25Plugin(BasePlugin):
 
         all_medias = []
 
+        img_max, img_min = self._image_pixel_bounds(processor)
         for img in images:
             if not isinstance(img, Image.Image):
                 img = self._regularize_images(
                     [img],
-                    image_max_pixels=getattr(
-                        processor, "image_max_pixels", 768 * 768),
-                    image_min_pixels=getattr(
-                        processor, "image_min_pixels", 32 * 32),
+                    image_max_pixels=img_max,
+                    image_min_pixels=img_min,
                 )["images"][0]
             all_medias.append({"type": "image", "image": img})
 
