@@ -1649,11 +1649,17 @@ class FSDP2Backend(BaseBackend):
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor
-        # Pass labels through to the model forward: multimodal models (e.g.
-        # kimi_k3) expand media placeholders inside forward and return the
-        # post-expansion labels on the output. Without labels in the forward
-        # inputs, the model cannot perform the expansion.
-        inputs["labels"] = labels
+        # Pass labels through to the model forward only when sequence
+        # parallel is off: multimodal models (e.g. kimi_k3) expand media
+        # placeholders inside forward and need the labels there to return
+        # post-expansion supervision. Under SP the model's logits are
+        # shard-local (T/sp per rank) while labels stay full-length, so a
+        # model that computes its own CE inside forward (e.g. kimi_k25)
+        # raises "Expected input batch_size (X) to match target
+        # batch_size (Y)"; the engine's SP-aware loss owns the CE there.
+        model_forward_labels = self._model_forward_labels(labels, sp_size)
+        if model_forward_labels is not None:
+            inputs["labels"] = model_forward_labels
         outputs, chunk_hidden_states = self._forward_for_lm_loss(
             model,
             inputs,
@@ -1668,19 +1674,23 @@ class FSDP2Backend(BaseBackend):
         expanded_labels = outputs.get("labels", None) if hasattr(outputs, "get") else None
         if expanded_labels is None:
             expanded_labels = getattr(outputs, "labels", None)
-        if (
-            expanded_labels is not None
-            and labels is not None
-            and expanded_labels.shape[-1] != labels.shape[-1]
-        ):
-            labels = expanded_labels
+        # Packing boundaries describe the pre-expansion token layout. After
+        # a model expands media placeholders inside forward they no longer
+        # delimit samples, and reusing them in _prepare_loss_labels masks
+        # away every post-expansion supervised token (CE sums to zero and
+        # training becomes a silent no-op). The collator already marks sample
+        # starts with ignore_index, so shift-by-one seams stay unsupervised
+        # without boundary metadata.
+        labels, loss_cu_seq_lens = self._swap_expanded_labels(
+            labels, expanded_labels, inputs.get("cu_seq_lens_q")
+        )
         dspark_loss_fn = getattr(outputs, "dspark_loss_fn", None)
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(
             model=model,
             outputs=outputs,
             labels=labels,
-            cu_seq_lens=inputs.get("cu_seq_lens_q"),
+            cu_seq_lens=loss_cu_seq_lens,
             chunk_hidden_states=chunk_hidden_states,
             sp_size=sp_size,
             sp_group=sp_group,
@@ -1709,7 +1719,7 @@ class FSDP2Backend(BaseBackend):
                         sp_group=sp_group,
                         sp_rank=sp_rank,
                         num_items_in_batch=num_items_in_batch,
-                        cu_seq_lens=inputs.get("cu_seq_lens_q"),
+                        cu_seq_lens=loss_cu_seq_lens,
                     )
                     num_tokens = (shifted_labels[0] != -100).sum()
                     if sp_size > 1:
@@ -1737,6 +1747,49 @@ class FSDP2Backend(BaseBackend):
                 sum(mtp_losses) * mtp_loss_scale
             ).detach()
         return (total_loss, outputs) if return_outputs else total_loss
+
+    @staticmethod
+    def _model_forward_labels(
+        labels: torch.Tensor | None,
+        sp_size: int,
+    ) -> torch.Tensor | None:
+        """Labels to hand into the model forward, or None to omit them.
+
+        Only single-rank SP forwards carry labels. Multimodal models expand
+        media placeholders inside forward and read the labels from their
+        inputs (kimi_k3), which is safe when logits and labels share one
+        layout. With SP the logits are shard-local while labels are
+        full-length, so a model that runs its own CE inside forward
+        (kimi_k25) fails on the batch-size check; the engine-side SP-aware
+        loss below already handles that case.
+        """
+        if sp_size == 1:
+            return labels
+        return None
+
+    @staticmethod
+    def _swap_expanded_labels(
+        labels: torch.Tensor | None,
+        expanded_labels: torch.Tensor | None,
+        loss_cu_seq_lens: Any,
+    ) -> tuple[torch.Tensor | None, Any]:
+        """Swap in model-side expanded labels and drop stale boundaries.
+
+        Text batches keep the engine-side labels and packing boundaries
+        untouched. Multimodal batches whose model expanded media placeholders
+        inside forward (e.g. kimi_k3) take the model-side post-expansion
+        labels, and the collator's packing boundaries — computed on the
+        pre-expansion layout — are dropped: sample starts are already
+        ignore_index from the collator, so shift-by-one seams stay
+        unsupervised without boundary metadata.
+        """
+        if (
+            expanded_labels is not None
+            and labels is not None
+            and expanded_labels.shape[-1] != labels.shape[-1]
+        ):
+            return expanded_labels, None
+        return labels, loss_cu_seq_lens
 
     @staticmethod
     def _prepare_loss_labels(
