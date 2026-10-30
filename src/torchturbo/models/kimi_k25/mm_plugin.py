@@ -58,7 +58,21 @@ class KimiK25Plugin(BasePlugin):
                 new_content = ""
                 for i in range(len(parts) - 1):
                     new_content += parts[i]
-                    media_item = {"type": "image", "image": images[img_idx]}
+                    # sharegpt-style datasets hand us image PATHS; the
+                    # vision processor's get_resize_config needs PIL images
+                    # (media_input['image'].size). get_mm_inputs already
+                    # regularizes via _regularize_images - mirror it here so
+                    # tokenize-time N-pad expansion works with path inputs.
+                    img = images[img_idx]
+                    if not isinstance(img, Image.Image):
+                        img = self._regularize_images(
+                            [img],
+                            image_max_pixels=getattr(
+                                processor, "image_max_pixels", 768 * 768),
+                            image_min_pixels=getattr(
+                                processor, "image_min_pixels", 32 * 32),
+                        )["images"][0]
+                    media_item = {"type": "image", "image": img}
                     seq_len = visual_processor.get_resize_config(media_item)[
                         "num_tokens"
                     ]
@@ -123,7 +137,13 @@ class KimiK25Plugin(BasePlugin):
 
         for img in images:
             if not isinstance(img, Image.Image):
-                img = self._regularize_images([img])["images"][0]
+                img = self._regularize_images(
+                    [img],
+                    image_max_pixels=getattr(
+                        processor, "image_max_pixels", 768 * 768),
+                    image_min_pixels=getattr(
+                        processor, "image_min_pixels", 32 * 32),
+                )["images"][0]
             all_medias.append({"type": "image", "image": img})
 
         for vid in videos:
